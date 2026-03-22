@@ -1,0 +1,4 @@
+Model,AUC-ROC,AUC-PR,Precision,Recall,F1
+XGBoost (baseline),0.9471,0.9626,0.8506,0.9536,0.8992
+CNN Only (sequence),0.9381,0.9731,0.9174,0.9319,0.9246
+Hybrid CNN + Attention (ours),0.9681,0.9772,0.9109,0.9302,0.9204
