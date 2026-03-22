@@ -110,7 +110,7 @@ Trained on 210,774 sequence pairs from:
 - CHANGE-seq (Lazzarotto et al. 2020)
 - CIRCLE-seq
 - SITE-seq (Cameron et al. 2017)
-- Synthetic negatives (4-tier generation method)
+- Synthetic negatives (7-tier generation method)
 
 ## Citation
 
@@ -126,8 +126,8 @@ If you use this tool, please cite:
 | MIT Score (Hsu 2013) | 0.2750 | 0.5865 |
 | CFD Score (Doench 2016) | 0.3358 | 0.6200 |
 | CNN Only | 0.9381 | 0.9731 |
-| XGBoost | 0.9618 | 0.9837 |
-| **Hybrid CNN+Attention (this model)** | **0.9661** | **0.9851** |
+| XGBoost | 0.9471 | 0.9626 |
+| **Hybrid CNN+Attention (this model)** | **0.9681** | **0.9772** |
 
 ## License
 
