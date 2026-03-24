@@ -129,6 +129,10 @@ If you use this tool, please cite:
 | XGBoost | 0.9471 | 0.9626 |
 | **Hybrid CNN+Attention (this model)** | **0.9681** | **0.9772** |
 
+Limitations
+Model performance drops on independent datasets (AUC-ROC ~0.63), indicating limited generalization
+Likely causes include dataset heterogeneity and reliance on sequence-derived features
+Future work will focus on improving cross-dataset robustness and incorporating additional biological context
 ## License
 
 MIT License
