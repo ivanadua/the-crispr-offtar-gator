@@ -1,4 +1,6 @@
-Model,AUC-ROC,AUC-PR,Precision,Recall,F1
+Model,	AUC-ROC,	AUC-PR,	Precision	Recall,	F1
+Logistic Regression (baseline),0.7146,0.7572,	0.7249,0.6669,0.6947
+Elevation-equivalent (Listgarten 2018),0.9418,0.9565,0.8551,0.9372,0.8943
 XGBoost (baseline),0.9471,0.9626,0.8506,0.9536,0.8992
 CNN Only (sequence),0.9381,0.9731,0.9174,0.9319,0.9246
-Hybrid CNN + Attention (ours),0.9681,0.9772,0.9109,0.9302,0.9204
+Hybrid CNN + Attention (mine),0.9681,0.9772,0.9109,0.9302,0.9204
