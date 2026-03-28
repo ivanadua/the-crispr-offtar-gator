@@ -1,26 +1,3 @@
-"""
-Haeussler 2016 Benchmark Evaluation
---------------------------------------
-Evaluates your hybrid model against the Haeussler 2016 benchmark dataset
-(Additional file 2 from Genome Biology 2016).
-
-This dataset contains 718 experimentally measured off-target cleavage
-frequencies (readFraction) for 26 guide RNAs. It is the standard
-benchmark used to compare CRISPR off-target scoring tools.
-
-Two analyses:
-1. AUC-ROC — binary classification (readFraction > 0 = cut)
-2. Spearman correlation — how well predicted probability tracks
-   actual cleavage frequency (continuous)
-
-Usage:
-    python evaluate_haeussler.py
-
-Output:
-    model_results/haeussler_evaluation.csv
-    model_results/figure10_haeussler_benchmark.png
-"""
-
 import sys
 sys.path.insert(0, '/Users/moana/Downloads/')
 
@@ -31,51 +8,55 @@ import torch.nn as nn
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr, pearsonr
-from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
+import json
 import os
-
-from shared_utils import encode_pair, BIO_FEATURES, RANDOM_SEED
+import joblib
+from itertools import combinations
+from scipy.stats import spearmanr
 from scipy.stats import entropy as scipy_entropy
+from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
-# ── PATHS ─────────────────────────────────────────────────────────────────────
+from shared_utils import encode_pair, BIO_FEATURES
+
 HAEUSSLER_PATH = '/Users/moana/Downloads/13059_2016_1012_MOESM2_ESM.tsv'
 MODEL_PATH     = '/Users/moana/Downloads/model_results/hybrid_model.pt'
 OUTPUT_DIR     = '/Users/moana/Downloads/model_results/'
-# ─────────────────────────────────────────────────────────────────────────────
+TRAIN_DATA     = '/Users/moana/Downloads/final dataset masterio_features_atac.csv'
 
-POS_WEIGHTS = torch.tensor([
-    0.05, 0.05, 0.05, 0.07, 0.07, 0.07, 0.08, 0.08, 0.08, 0.10,
-    0.12, 0.15, 0.20, 0.30, 0.40, 0.55, 0.70, 0.85, 0.95, 1.00
+DARK  = '#2C2C2A'
+MID   = '#5F5E5A'
+SPINE = '#D3D1C7'
+
+POS_WEIGHTS   = torch.tensor([
+    0.05,0.05,0.05,0.07,0.07,0.07,0.08,0.08,0.08,0.10,
+    0.12,0.15,0.20,0.30,0.40,0.55,0.70,0.85,0.95,1.00
 ], dtype=torch.float32)
-
-BASES         = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 SEED_POSITIONS = set(range(16, 20))
+DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
-if torch.backends.mps.is_available():
-    DEVICE = torch.device('mps')
-else:
-    DEVICE = torch.device('cpu')
-
+# ── Model definition ──────────────────────────────────────────────────────────
 class HybridModel(nn.Module):
     def __init__(self, n_bio=12):
         super().__init__()
-        self.conv1 = nn.Conv1d(8, 64,  kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        self.bn1   = nn.BatchNorm1d(64)
-        self.bn2   = nn.BatchNorm1d(128)
-        self.attn  = nn.MultiheadAttention(128, num_heads=4, batch_first=True, dropout=0.1)
+        self.conv1    = nn.Conv1d(8,  64,  kernel_size=3, padding=1)
+        self.conv2    = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn1      = nn.BatchNorm1d(64)
+        self.bn2      = nn.BatchNorm1d(128)
+        self.attn     = nn.MultiheadAttention(128, num_heads=4, batch_first=True, dropout=0.1)
         self.register_buffer('pos_weights', POS_WEIGHTS)
         self.seq_pool = nn.AdaptiveAvgPool1d(1)
         self.seq_fc   = nn.Linear(128, 64)
         self.bio_fc1  = nn.Linear(n_bio, 64)
         self.bio_fc2  = nn.Linear(64, 32)
         self.bio_bn   = nn.BatchNorm1d(64)
-        self.fuse1 = nn.Linear(96, 64)
-        self.fuse2 = nn.Linear(64, 32)
-        self.fuse3 = nn.Linear(32, 1)
-        self.drop  = nn.Dropout(0.3)
-        self.relu  = nn.ReLU()
+        self.fuse1    = nn.Linear(96, 64)
+        self.fuse2    = nn.Linear(64, 32)
+        self.fuse3    = nn.Linear(32, 1)
+        self.drop     = nn.Dropout(0.3)
+        self.relu     = nn.ReLU()
 
     def forward(self, x_seq, x_bio):
         x = x_seq.permute(0, 2, 1)
@@ -94,6 +75,7 @@ class HybridModel(nn.Module):
         x_f = self.drop(self.relu(self.fuse2(x_f)))
         return self.fuse3(x_f).squeeze(-1)
 
+# ── Sequence utilities ────────────────────────────────────────────────────────
 def clean_seq(seq):
     return str(seq).upper().strip().replace('-', '')
 
@@ -102,7 +84,7 @@ def gc_content(seq):
     return (seq.count('G') + seq.count('C')) / len(seq) if seq else 0.0
 
 def shannon_entropy(seq):
-    seq = seq[:20].upper()
+    seq    = seq[:20].upper()
     counts = [seq.count(b) / len(seq) for b in 'ACGT']
     counts = [c for c in counts if c > 0]
     return float(scipy_entropy(counts, base=2)) if counts else 0.0
@@ -131,27 +113,22 @@ def get_mfe(seq):
     except:
         return -2.0
 
-def compute_features(target, offtarget):
+def compute_bio_features(target, offtarget):
     target    = clean_seq(target)
     offtarget = clean_seq(offtarget)
     seed_mm, nonseed_mm, pam_score = get_mismatch_info(target, offtarget)
     mm_count = seed_mm + nonseed_mm
     return np.array([
-        gc_content(target),
-        gc_content(offtarget),
-        shannon_entropy(target),
-        shannon_entropy(offtarget),
-        float(mm_count),
-        float(seed_mm),
-        float(nonseed_mm),
+        gc_content(target), gc_content(offtarget),
+        shannon_entropy(target), shannon_entropy(offtarget),
+        float(mm_count), float(seed_mm), float(nonseed_mm),
         float(pam_score),
         float(len(target.replace('N', ''))),
         float(get_mfe(target)),
-        0.0,   # has_bulge — set to 0, no dash info in this dataset
-        0.0,   # atac_accessible — unknown for this dataset
+        0.0, 0.0,   # has_bulge, atac_accessible unknown
     ], dtype=np.float32)
 
-# CFD score for comparison
+# ── CFD / MIT scores ──────────────────────────────────────────────────────────
 CFD_MM_SCORES = {
     'rA:dA': [0,0,0.014,0,0,0.395,0.317,0,0.389,0.079,0.445,0.508,0.613,0.851,0.732,0.828,0.615,0.804,0.685,0.583],
     'rA:dG': [0.059,0.059,0.078,0.082,0.044,0.105,0.094,0.110,0.073,0.129,0.084,0.181,0.183,0.213,0.237,0.207,0.222,0.186,0.145,0.237],
@@ -164,6 +141,8 @@ CFD_MM_SCORES = {
     'rT:dC': [0,0,0,0.023,0.030,0.022,0.019,0.030,0.022,0.019,0.025,0.030,0.036,0.037,0.035,0.031,0.030,0.030,0.022,0.029],
     'rT:dG': [0,0,0,0.049,0.060,0.054,0.049,0.065,0.055,0.059,0.076,0.083,0.096,0.108,0.101,0.106,0.097,0.105,0.083,0.099],
 }
+MIT_W = [0,0,0.014,0,0,0.395,0.317,0,0.389,0.079,
+         0.445,0.508,0.613,0.851,0.732,0.828,0.615,0.804,0.685,0.583]
 
 def calc_cfd(guide, offtarget):
     guide     = str(guide)[:20].upper().replace('T', 'U')
@@ -177,103 +156,177 @@ def calc_cfd(guide, offtarget):
         g_dna = g.replace('U', 'T')
         if g_dna != o:
             key = f'r{g}:d{o}'
-            if key in CFD_MM_SCORES:
-                score *= (1 - CFD_MM_SCORES[key][i])
-            else:
-                score *= 0.5
-    return score
+            score *= (1 - CFD_MM_SCORES.get(key, [0.5]*20)[i])
+    return float(score)
 
 def calc_mit(guide, offtarget):
     guide     = str(guide)[:20].upper()
     offtarget = str(offtarget)[:20].upper()
     if len(guide) < 20 or len(offtarget) < 20:
         return np.nan
-    MIT_W = [0,0,0.014,0,0,0.395,0.317,0,0.389,0.079,0.445,0.508,0.613,0.851,0.732,0.828,0.615,0.804,0.685,0.583]
-    mm_pos = [i for i,(g,o) in enumerate(zip(guide,offtarget)) if g!=o and g!='N' and o!='N']
+    mm_pos = [i for i, (g, o) in enumerate(zip(guide, offtarget))
+              if g != o and g != 'N' and o != 'N']
     n = len(mm_pos)
-    if n == 0: return 1.0
-    if n > 1:
-        pairs = [(mm_pos[i],mm_pos[j]) for i in range(n) for j in range(i+1,n)]
-        mean_dist = np.mean([abs(a-b) for a,b in pairs])
-        d_pen = 1.0 / ((19 - mean_dist) / 19 * 4 + 1)
-    else:
-        d_pen = 1.0
+    if n == 0:
+        return 1.0
+    d_pen = (1.0 / ((19 - np.mean([abs(a-b) for a,b in combinations(mm_pos,2)])) / 19 * 4 + 1)
+             if n > 1 else 1.0)
     w_pen = 1.0
     for p in mm_pos:
         w_pen *= (1 - MIT_W[p])
-    n_pen = 1.0 / (n**2 if n > 1 else 1)
-    return float(np.clip(w_pen * d_pen * n_pen, 0, 1))
+    return float(np.clip(w_pen * d_pen / (n**2 if n > 1 else 1), 0, 1))
+
+# ── Elevation features ────────────────────────────────────────────────────────
+def elevation_features(target, offtarget):
+    t = str(target)[:20].upper()
+    o = str(offtarget)[:20].upper()
+    mm_vec = np.zeros(20, dtype=np.float32)
+    for i, (tb, ob) in enumerate(zip(t, o)):
+        if tb != ob and tb != 'N' and ob != 'N':
+            mm_vec[i] = 1.0
+    mm_pos   = np.where(mm_vec)[0].tolist()
+    n_mm     = len(mm_pos)
+    pair_vec = np.zeros(190, dtype=np.float32)
+    pair_idx = {(i,j): k for k,(i,j) in enumerate(combinations(range(20), 2))}
+    for i, j in combinations(mm_pos, 2):
+        pair_vec[pair_idx[(i,j)]] = 1.0
+    mean_dist = (np.mean([abs(a-b) for a,b in combinations(mm_pos,2)])
+                 if n_mm > 1 else 0.0)
+    return np.concatenate([
+        [calc_cfd(target, offtarget)],
+        [float(n_mm)],
+        mm_vec,
+        pair_vec,
+        [mean_dist],
+    ]).astype(np.float32)
+
+def style_ax(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    for sp in ['bottom', 'left']:
+        ax.spines[sp].set_color(SPINE)
+    ax.tick_params(colors=MID)
+    ax.xaxis.label.set_color(DARK)
+    ax.yaxis.label.set_color(DARK)
+    ax.title.set_color(DARK)
 
 def main():
     print("=" * 60)
     print("   Haeussler 2016 Benchmark Evaluation")
     print("=" * 60)
 
-    # Load dataset
     df = pd.read_csv(HAEUSSLER_PATH, sep='\t')
     print(f"\nLoaded {len(df)} off-target pairs")
     print(f"Guides: {df['name'].nunique()}")
-    print(f"readFraction range: {df['readFraction'].min():.4f} — {df['readFraction'].max():.4f}")
+    print(f"readFraction range: {df['readFraction'].min():.4f} — "
+          f"{df['readFraction'].max():.4f}")
 
-    # Clean sequences
     df['guide_clean'] = df['guideSeq'].apply(lambda s: clean_seq(str(s))[:20])
     df['ot_clean']    = df['otSeq'].apply(lambda s: clean_seq(str(s))[:20])
+    df['is_cut']      = (df['readFraction'] > 0).astype(int)
+    print(f"Binary labels: {df['is_cut'].sum()} cuts, "
+          f"{(df['is_cut']==0).sum()} non-cuts")
 
-    # Binary label: readFraction > 0 means it cuts
-    df['is_cut'] = (df['readFraction'] > 0).astype(int)
-    print(f"\nBinary labels: {df['is_cut'].sum()} cuts, {(df['is_cut']==0).sum()} non-cuts")
-
-    # Load model
+    # ── Hybrid model predictions ──────────────────────────────────────────────
     print("\nLoading hybrid model...")
     model = HybridModel(n_bio=12)
     model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
-    model = model.to(DEVICE)
-    model.eval()
+    model.to(DEVICE).eval()
 
-    # Compute model predictions
-    print("Computing hybrid model predictions...")
+    print("Computing hybrid predictions...")
     hybrid_probs = []
     for _, row in df.iterrows():
         try:
-            features = compute_features(row['guide_clean'], row['ot_clean'])
-            x_seq = torch.tensor(
-                encode_pair(row['guide_clean'], row['ot_clean']),
-                dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            x_bio = torch.tensor(features).unsqueeze(0).to(DEVICE)
+            bio  = compute_bio_features(row['guide_clean'], row['ot_clean'])
+            xc   = torch.tensor(
+                       encode_pair(row['guide_clean'], row['ot_clean']),
+                       dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            xf   = torch.tensor(bio).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
-                prob = torch.sigmoid(model(x_seq, x_bio)).item()
+                p = torch.sigmoid(model(xc, xf)).item()
         except:
-            prob = np.nan
-        hybrid_probs.append(prob)
+            p = np.nan
+        hybrid_probs.append(p)
     df['hybrid_prob'] = hybrid_probs
 
-    # Compute CFD and MIT scores
+    # ── CFD / MIT scores ──────────────────────────────────────────────────────
     print("Computing CFD and MIT scores...")
-    df['cfd_score'] = df.apply(lambda r: calc_cfd(r['guide_clean'], r['ot_clean']), axis=1)
-    df['mit_score'] = df.apply(lambda r: calc_mit(r['guide_clean'], r['ot_clean']), axis=1)
+    df['cfd_score'] = [calc_cfd(r.guide_clean, r.ot_clean)
+                       for r in df.itertuples()]
+    df['mit_score'] = [calc_mit(r.guide_clean, r.ot_clean)
+                       for r in df.itertuples()]
 
-    # Drop NaN rows
-    df_valid = df.dropna(subset=['hybrid_prob', 'cfd_score', 'mit_score'])
-    print(f"Valid rows: {len(df_valid)}")
+    # ── Logistic Regression ───────────────────────────────────────────────────
+    print("Computing logistic regression predictions...")
+    print("  (retraining on full training data — takes ~1 min)")
+    df_train = pd.read_csv(TRAIN_DATA, low_memory=False)
+    from shared_utils import guide_aware_split
+    split    = guide_aware_split(df_train)
+    df_tr    = df_train[split['train_mask']]
+    X_tr     = df_tr[BIO_FEATURES].fillna(0).values.astype(np.float32)
+    y_tr     = df_tr['is_cut'].values
+    pos      = y_tr.sum(); neg = len(y_tr) - pos
+    cw       = {0: pos/len(y_tr), 1: neg/len(y_tr)}
+    logreg   = Pipeline([('sc', StandardScaler()),
+                         ('clf', LogisticRegression(max_iter=1000,
+                                                     class_weight=cw,
+                                                     solver='lbfgs',
+                                                     C=1.0,
+                                                     random_state=42))])
+    logreg.fit(X_tr, y_tr)
 
-    y_true  = df_valid['is_cut'].values
-    y_freq  = df_valid['readFraction'].values
+    logreg_probs = []
+    for _, row in df.iterrows():
+        bio = compute_bio_features(row['guide_clean'], row['ot_clean'])
+        p   = logreg.predict_proba(bio.reshape(1, -1))[0, 1]
+        logreg_probs.append(float(p))
+    df['logreg_prob'] = logreg_probs
 
-    # ── AUC EVALUATION ───────────────────────────────────────────────────────
+    # ── Elevation ─────────────────────────────────────────────────────────────
+    print("Computing Elevation-equivalent predictions...")
+    print("  (retraining GBM on full training data — takes ~5 min)")
+    from sklearn.ensemble import GradientBoostingClassifier
+    X_el     = np.array([elevation_features(r.target_seq, r.offtarget_seq)
+                         for r in df_tr.itertuples()])
+    sw       = np.where(y_tr == 1, neg/pos, 1.0)
+    elev_clf = GradientBoostingClassifier(n_estimators=300, max_depth=4,
+                                           learning_rate=0.05, subsample=0.8,
+                                           min_samples_leaf=20, random_state=42)
+    elev_clf.fit(X_el, y_tr, sample_weight=sw)
+
+    elev_probs = []
+    for _, row in df.iterrows():
+        feats = elevation_features(row['guide_clean'], row['ot_clean'])
+        p     = elev_clf.predict_proba(feats.reshape(1, -1))[0, 1]
+        elev_probs.append(float(p))
+    df['elevation_prob'] = elev_probs
+
+    # ── Evaluate all methods ──────────────────────────────────────────────────
+    df_valid = df.dropna(subset=['hybrid_prob', 'cfd_score', 'mit_score',
+                                 'logreg_prob', 'elevation_prob'])
+    print(f"\nValid rows: {len(df_valid)}")
+
+    y_true = df_valid['is_cut'].values
+    y_freq = df_valid['readFraction'].values
+
+    score_cols = {
+        'MIT Score':                df_valid['mit_score'].values,
+        'CFD Score':                df_valid['cfd_score'].values,
+        'otScore (Haeussler)':      df_valid['otScore'].values,
+        'Logistic Regression':      df_valid['logreg_prob'].values,
+        'Elevation-equivalent':     df_valid['elevation_prob'].values,
+        'Hybrid CNN+Attention':     df_valid['hybrid_prob'].values,
+    }
+
     results = {}
-    for name, scores in [
-        ('MIT Score',              df_valid['mit_score'].values),
-        ('CFD Score',              df_valid['cfd_score'].values),
-        ('Hybrid CNN+Attention',   df_valid['hybrid_prob'].values),
-        ('otScore (Haeussler)',    df_valid['otScore'].values),
-    ]:
+    for name, scores in score_cols.items():
         try:
             auc   = roc_auc_score(y_true, scores)
             auprc = average_precision_score(y_true, scores)
             sp_r, sp_p = spearmanr(scores, y_freq)
             results[name] = {
-                'AUC-ROC': round(auc, 4),
-                'AUC-PR':  round(auprc, 4),
+                'AUC-ROC':    round(auc,  4),
+                'AUC-PR':     round(auprc,4),
                 'Spearman_r': round(sp_r, 4),
                 'Spearman_p': round(sp_p, 6),
             }
@@ -283,78 +336,95 @@ def main():
     print(f"\n{'='*60}")
     print("  HAEUSSLER BENCHMARK RESULTS")
     print(f"{'='*60}")
-    df_results = pd.DataFrame(results).T
-    print(df_results.to_string())
+    df_res = pd.DataFrame(results).T
+    print(df_res.to_string())
 
-    # Save
-    df_valid.to_csv(os.path.join(OUTPUT_DIR, 'haeussler_evaluation.csv'), index=False)
-    df_results.to_csv(os.path.join(OUTPUT_DIR, 'haeussler_results.csv'))
+    df_valid.to_csv(os.path.join(OUTPUT_DIR, 'haeussler_evaluation.csv'),
+                    index=False)
+    df_res.to_csv(os.path.join(OUTPUT_DIR, 'haeussler_results.csv'))
 
-    # ── FIGURES ───────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # ── Figure ────────────────────────────────────────────────────────────────
+    COLORS = {
+        'MIT Score':            '#888780',
+        'CFD Score':            '#5F5E5A',
+        'otScore (Haeussler)':  '#D85A30',
+        'Logistic Regression':  '#7F77DD',
+        'Elevation-equivalent': '#D4537E',
+        'Hybrid CNN+Attention': '#1D9E75',
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    fig.patch.set_facecolor('white')
 
     # Left: ROC curves
     ax = axes[0]
-    ax.plot([0,1],[0,1],'k--',alpha=0.4,linewidth=1,label='Random')
-    colors = {'MIT Score': '#95a5a6', 'CFD Score': '#7f8c8d',
-              'Hybrid CNN+Attention': '#2ecc71', 'otScore (Haeussler)': '#e74c3c'}
-    for name, scores in [
-        ('MIT Score',           df_valid['mit_score'].values),
-        ('CFD Score',           df_valid['cfd_score'].values),
-        ('otScore (Haeussler)', df_valid['otScore'].values),
-        ('Hybrid CNN+Attention',df_valid['hybrid_prob'].values),
-    ]:
+    ax.plot([0,1],[0,1], color=SPINE, linewidth=1, linestyle='--',
+            label='Random (AUC = 0.50)')
+    order = ['MIT Score', 'CFD Score', 'otScore (Haeussler)',
+             'Logistic Regression', 'Elevation-equivalent',
+             'Hybrid CNN+Attention']
+    for name in order:
+        scores = score_cols[name]
         try:
             fpr, tpr, _ = roc_curve(y_true, scores)
             auc = results[name]['AUC-ROC']
-            ax.plot(fpr, tpr, color=colors[name], linewidth=2.5,
-                    label=f'{name} (AUC={auc})')
+            lw  = 3.0 if 'Hybrid' in name else 1.8
+            ax.plot(fpr, tpr, color=COLORS[name], linewidth=lw,
+                    label=f'{name}  (AUC = {auc:.4f})')
         except:
             pass
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ROC Curves\nHaeussler 2016 Benchmark', fontsize=12, fontweight='bold')
-    ax.legend(fontsize=8, loc='lower right')
-    ax.grid(alpha=0.3)
+    ax.set_xlabel('False positive rate', fontsize=12)
+    ax.set_ylabel('True positive rate', fontsize=12)
+    ax.set_title('ROC curves\nHaeussler 2016 benchmark', fontsize=12, pad=8)
+    ax.legend(fontsize=7.5, loc='lower right', frameon=False)
+    ax.set_xlim([0,1]); ax.set_ylim([0,1.02])
+    ax.yaxis.grid(True, color=SPINE, linewidth=0.5)
+    ax.set_axisbelow(True)
+    style_ax(ax)
 
-    # Middle: Spearman correlation scatter
+    # Middle: scatter hybrid vs measured
     ax2 = axes[1]
     ax2.scatter(df_valid['hybrid_prob'], df_valid['readFraction'],
-                alpha=0.5, color='#2ecc71', s=20)
+                alpha=0.5, color='#1D9E75', s=20)
     sp_r = results.get('Hybrid CNN+Attention', {}).get('Spearman_r', 0)
-    ax2.set_xlabel('Predicted Cleavage Probability', fontsize=12)
-    ax2.set_ylabel('Measured Read Fraction', fontsize=12)
-    ax2.set_title(f'Predicted vs Measured Cleavage\nSpearman r = {sp_r:.4f}',
-                  fontsize=12, fontweight='bold')
-    ax2.grid(alpha=0.3)
+    sp_p = results.get('Hybrid CNN+Attention', {}).get('Spearman_p', 0)
+    ax2.set_xlabel('Predicted cleavage probability', fontsize=12)
+    ax2.set_ylabel('Measured read fraction', fontsize=12)
+    ax2.set_title(f'Predicted vs measured cleavage\n'
+                  f'Spearman ρ = {sp_r:.4f}  (p = {sp_p:.4f})',
+                  fontsize=12, pad=8)
+    ax2.yaxis.grid(True, color=SPINE, linewidth=0.5)
+    ax2.set_axisbelow(True)
+    style_ax(ax2)
 
-    # Right: AUC comparison bar chart
-    ax3 = axes[2]
-    names = list(results.keys())
-    aucs  = [results[n]['AUC-ROC'] for n in names]
-    bar_colors = ['#2ecc71' if 'Hybrid' in n else
-                  '#e74c3c' if 'Haeussler' in n else '#bdc3c7'
-                  for n in names]
-    bars = ax3.barh(range(len(names)), aucs, color=bar_colors, alpha=0.85)
+    # Right: AUC bar chart
+    ax3      = axes[2]
+    names    = list(results.keys())
+    auc_vals = [results[n]['AUC-ROC'] for n in names]
+    bars     = ax3.barh(range(len(names)), auc_vals,
+                        color=[COLORS.get(n, '#B4B2A9') for n in names],
+                        alpha=0.85)
     ax3.set_yticks(range(len(names)))
-    ax3.set_yticklabels(names, fontsize=10)
+    ax3.set_yticklabels(names, fontsize=9.5)
     ax3.set_xlabel('AUC-ROC', fontsize=12)
-    ax3.set_title('AUC Comparison\nHaeussler Benchmark', fontsize=12, fontweight='bold')
-    ax3.set_xlim([0.4, 1.02])
-    for bar, val in zip(bars, aucs):
+    ax3.set_title('AUC-ROC comparison\nHaeussler benchmark', fontsize=12, pad=8)
+    ax3.set_xlim([0, 1.05])
+    ax3.axvline(x=0.5, color=SPINE, linestyle='--', linewidth=1)
+    for bar, val in zip(bars, auc_vals):
         ax3.text(val + 0.005, bar.get_y() + bar.get_height()/2,
-                 f'{val:.4f}', va='center', fontsize=9)
-    ax3.grid(alpha=0.3, axis='x')
+                 f'{val:.4f}', va='center', fontsize=9, color=MID)
+    ax3.xaxis.grid(True, color=SPINE, linewidth=0.5)
+    ax3.set_axisbelow(True)
+    style_ax(ax3)
 
-    plt.suptitle('Figure 10 — Validation on Haeussler 2016 Benchmark Dataset',
-                 fontsize=13, fontweight='bold')
-    plt.tight_layout()
+    fig.suptitle('Figure 10 — Validation on Haeussler 2016 benchmark dataset',
+                 fontsize=13, color=DARK, fontweight='500')
+    plt.tight_layout(pad=2.0)
     path = os.path.join(OUTPUT_DIR, 'figure10_haeussler_benchmark.png')
-    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
-
-    print(f"\n✅ Figure saved to {path}")
-    print(f"✅ Results saved to {OUTPUT_DIR}haeussler_results.csv")
+    print(f"\nSaved figure: {path}")
+    print(f"Saved results: {OUTPUT_DIR}haeussler_results.csv")
 
 if __name__ == "__main__":
     main()
