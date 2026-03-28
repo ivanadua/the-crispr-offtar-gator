@@ -1,5 +1,7 @@
-,AUC-ROC,AUC-PR,Spearman_r,Spearman_p
-MIT Score,0.5711,0.961,0.2395,0.0
-CFD Score,0.5094,0.95,0.1035,0.005515
-Hybrid CNN+Attention,0.6321,0.9705,0.1203,0.001244
-otScore (Haeussler),0.5626,0.9602,0.2306,0.0
+	AUC-ROC	AUC-PR	Spearman_r	Spearman_p
+MIT Score	0.5711	0.961	0.2395	0.0
+CFD Score	0.5094	0.95	0.1035	0.005515
+otScore (Haeussler)	0.5626	0.9602	0.2306	0.0
+Logistic Regression	0.6529	0.9684	0.0312	0.404454
+Elevation-equivalent	0.6734	0.9764	0.0665	0.075087
+Hybrid CNN+Attention	0.6865	0.9756	0.1462	8.4E-05
