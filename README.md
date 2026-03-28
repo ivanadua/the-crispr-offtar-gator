@@ -127,6 +127,8 @@ If you use this tool, please cite:
 | CFD Score (Doench 2016) | 0.3358 | 0.6200 |
 | CNN Only | 0.9381 | 0.9731 |
 | XGBoost | 0.9471 | 0.9626 |
+| Logistic Regression (baseline) | 0.7146 | 0.7572 |
+| Elevation-equivalent (Listgarten 2018)| 0.9418 | 0.9565 |
 | **Hybrid CNN+Attention (this model)** | **0.9681** | **0.9772** |
 
 Limitations
